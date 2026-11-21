@@ -96,3 +96,62 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+# ── 清理备份回读 / 回滚 ───────────────────────────────────────
+# 固定路径必须在 /{module}/{entry_id} 之外单独注册，避免被数字 id 规则抢匹配。
+
+@router.post("/retention_job/{entry_id}/dry-run", response_model=dict)
+def dry_run_cleanup(entry_id: int, data_rows: int, retention_days: str | None = None) -> dict[str, Any]:
+    """预演清理：首次预演写入清理前恢复快照，再次预演给出两组候选行数。"""
+    service = require_service("retention_job")
+    result = service.dry_run_cleanup(entry_id, data_rows, retention_days=retention_days)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "预演失败"))
+    return result
+
+
+@router.post("/retention_job/{entry_id}/policy-correction", response_model=dict)
+def correct_retention_policy(
+    entry_id: int,
+    retention_days: str | None = None,
+    next_run: str | None = None,
+    candidate_count: int | None = None,
+) -> dict[str, Any]:
+    """清理期间到达的策略订正：只改当前计划，不改冻结备份。"""
+    service = require_service("retention_job")
+    result = service.correct_policy(
+        entry_id, retention_days=retention_days, next_run=next_run,
+        candidate_count=candidate_count,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "订正失败"))
+    return result
+
+
+@router.get("/retention_job/{entry_id}/backup", response_model=dict)
+def get_cleanup_backup(entry_id: int) -> dict[str, Any]:
+    service = require_service("retention_job")
+    backup = service.get_cleanup_backup(entry_id)
+    if backup is None:
+        raise HTTPException(status_code=404, detail=f"清理计划 {entry_id} 没有清理前恢复快照")
+    return backup
+
+
+@router.post("/retention_job/{entry_id}/restore", response_model=dict)
+def restore_cleanup(entry_id: int, snapshot_id: str | None = None) -> dict[str, Any]:
+    service = require_service("retention_job")
+    result = service.restore_cleanup(entry_id, snapshot_id=snapshot_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "回滚失败"))
+    return result
+
+
+@router.get("/version_history/{entry_id}/snapshot", response_model=dict)
+def get_snapshot_detail(entry_id: int, snapshot_ref: str | None = None) -> dict[str, Any]:
+    service = require_service("version_history")
+    reference = snapshot_ref or str(entry_id)
+    detail = service.get_snapshot_detail(reference)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"版本快照 {reference} 不存在")
+    return detail

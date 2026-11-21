@@ -116,6 +116,43 @@ class LifecyclePolicyService(BaseModuleService):
         store.rows("retention_job").append(task)
         return task
 
+    def revise_retention(self, policy_id: int, retention_days: str | int,
+                         candidate_count: int | None = None) -> dict[str, Any]:
+        """策略订正：把新的保留期限下发给该策略触发的清理计划。
+
+        订正可能发生在清理执行期间，由保留清理服务决定只改当前计划、
+        不回写清理前快照，并在恢复后重新计算待选范围。
+        """
+        policy = self.get_entry(policy_id)
+        if not policy:
+            return {"ok": False, "error": "策略不存在"}
+
+        from app.services.retention_job import RetentionJobService
+
+        cleanup = RetentionJobService()
+        updated = []
+        for job in store.rows("retention_job"):
+            if job.get("triggered_by_id") != policy_id:
+                continue
+            result = cleanup.correct_policy(
+                int(job["id"]), retention_days=retention_days,
+                candidate_count=candidate_count,
+            )
+            if result.get("ok"):
+                updated.append(result)
+
+        store.log_change(
+            self.MODULE, policy_id, "保留期限订正",
+            before=policy.get("保留阶段", ""), after=f"保留{retention_days}天",
+            source="lifecycle_policy", scope="lifecycle_policy->retention_job"
+        )
+        return {
+            "ok": True,
+            "policy_id": policy_id,
+            "retention_days": str(retention_days),
+            "updated_jobs": updated,
+        }
+
     def get_lifecycle_stage(self, asset_code: str) -> str | None:
         """查询资产的当前生命周期阶段。"""
         policies = store.find_by_field(self.MODULE, "目标资产", asset_code)

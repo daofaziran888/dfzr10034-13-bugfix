@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import time as _time
 from collections import defaultdict
 from typing import Any
@@ -25,8 +26,16 @@ class Store:
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
         self._change_log: list[dict[str, Any]] = []
-        self._snapshots: dict[str, list[dict[str, Any]]] = {}
+        self._snapshots: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._snapshot_metadata: dict[str, dict[str, Any]] = {}
         self._pipeline_state: dict[str, dict[str, Any]] = {}
+        # reset() 也会走 _seed；锁对象跨重置复用，避免并发时换锁失效。
+        if not hasattr(self, "_lock"):
+            self._lock = threading.RLock()
+
+    def lock(self) -> threading.RLock:
+        """跨线程串行化"先判断再写入"的快照/回滚操作。"""
+        return self._lock
 
     def reset(self) -> None:
         """清空所有数据并重新种子化（测试用）。"""
@@ -119,24 +128,52 @@ class Store:
 
     # ── 快照 ──────────────────────────────────────────────────
 
-    def create_snapshot(self, snapshot_id: str, modules: list[str] | None = None) -> dict[str, Any]:
-        """创建指定模块的快照。"""
+    def create_snapshot(
+        self,
+        snapshot_id: str,
+        modules: list[str] | None = None,
+        *,
+        reason: str = "自动快照",
+        metadata: dict[str, Any] | None = None,
+        row_counts: dict[str, int | str] | None = None,
+    ) -> dict[str, Any]:
+        """创建指定模块的快照。
+
+        同一 snapshot_id 重复创建时只保留第一份数据副本，返回 ``replayed=True``，
+        避免并发/回执重送把先前的预演快照覆盖成执行后的状态。
+
+        ``row_counts`` 允许调用方覆盖版本履历里的「行数记录」。清理预演的
+        候选行数并不等于计划表条数，必须让版本列表直接记录候选行数，
+        恢复人员才能在快照详情里核对执行前的确认值。
+        """
         target_modules = modules or self.module_names()
+        if snapshot_id in self._snapshots:
+            snap = self._snapshots[snapshot_id]
+            return {
+                "snapshot_id": snapshot_id,
+                "modules": list(snap),
+                "rows": sum(len(v) for v in snap.values()),
+                "replayed": True,
+                "version_entries": self.find_version_entries(snapshot_id),
+            }
+
         snap = {}
         for mod in target_modules:
             snap[mod] = copy.deepcopy(self.rows(mod))
         self._snapshots[snapshot_id] = snap
+        self._snapshot_metadata[snapshot_id] = copy.deepcopy(metadata or {})
 
         # 记录到 version_history
         for mod in target_modules:
+            recorded_rows = (row_counts or {}).get(mod, len(snap[mod]))
             version_entry = {
                 "id": self.next_id("version_history"),
                 "快照编号": f"{snapshot_id}-{mod}",
                 "目标资产": mod,
                 "版本标签": snapshot_id,
                 "Schema摘要": json.dumps(list(snap[mod][0].keys()) if snap[mod] else []),
-                "行数记录": str(len(snap[mod])),
-                "创建原因": "自动快照",
+                "行数记录": str(recorded_rows),
+                "创建原因": reason,
                 "差异字段": "",
                 "快照时间": _time.strftime("%Y-%m-%d %H:%M:%S"),
                 "status": "历史版本",
@@ -145,10 +182,73 @@ class Store:
             }
             self.rows("version_history").append(version_entry)
 
-        return {"snapshot_id": snapshot_id, "modules": target_modules, "rows": sum(len(v) for v in snap.values())}
+        return {
+            "snapshot_id": snapshot_id,
+            "modules": target_modules,
+            "rows": sum(len(v) for v in snap.values()),
+            "replayed": False,
+            "version_entries": self.find_version_entries(snapshot_id),
+        }
 
     def get_snapshot(self, snapshot_id: str) -> dict[str, list[dict[str, Any]]] | None:
         return self._snapshots.get(snapshot_id)
+
+    def get_snapshot_metadata(self, snapshot_id: str) -> dict[str, Any] | None:
+        return self._snapshot_metadata.get(snapshot_id)
+
+    def find_version_entries(self, snapshot_id: str) -> list[dict[str, Any]]:
+        """按快照编号/版本标签在版本履历里定位已有的备份记录。"""
+        return [
+            row for row in self.rows("version_history")
+            if row.get("版本标签") == snapshot_id or row.get("快照编号") == snapshot_id
+        ]
+
+    def restore_snapshot(
+        self,
+        snapshot_id: str,
+        modules: list[str] | None = None,
+        entry_ids: list[int] | None = None,
+    ) -> dict[str, Any] | None:
+        """用快照数据回滚指定模块，返回各模块回滚前后的行数。
+
+        只替换快照里存在的模块，未包含的模块保持原样。传入 ``entry_ids``
+        时只回滚这些记录（单条计划恢复不会覆盖同表的其他计划）。
+        """
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return None
+        target_modules = modules or list(snap)
+        restored: dict[str, dict[str, int]] = {}
+        for mod in target_modules:
+            if mod not in snap:
+                continue
+            before = len(self.rows(mod))
+            if entry_ids is None:
+                self._tables[mod] = copy.deepcopy(snap[mod])
+            else:
+                wanted = set(entry_ids)
+                live_rows = self.rows(mod)
+                frozen_rows = {
+                    int(row.get("id", 0)): copy.deepcopy(row)
+                    for row in snap[mod]
+                    if int(row.get("id", 0)) in wanted
+                }
+                live_rows[:] = [
+                    copy.deepcopy(frozen_rows[int(row.get("id", 0))])
+                    if int(row.get("id", 0)) in frozen_rows else row
+                    for row in live_rows
+                ]
+                present = {int(row.get("id", 0)) for row in live_rows}
+                for rid, row in frozen_rows.items():
+                    if rid not in present:
+                        live_rows.append(row)
+            restored[mod] = {"before": before, "after": len(self.rows(mod))}
+        return {
+            "snapshot_id": snapshot_id,
+            "modules": target_modules,
+            "restored": restored,
+            "metadata": copy.deepcopy(self._snapshot_metadata.get(snapshot_id, {})),
+        }
 
     def diff_snapshots(self, snap_a: str, snap_b: str, module: str | None = None) -> list[dict[str, Any]]:
         """比较两个快照的差异，生成差异报告。"""
